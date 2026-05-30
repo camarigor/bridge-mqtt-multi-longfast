@@ -1,72 +1,72 @@
 # bridge-mqtt-multi-longfast
 
-Republicador de canal Meshtastic entre **dois servidores MQTT**, permitindo que
-um único device participe do **LongFast público de cada servidor** e **escolha
-por mensagem** para qual ir — algo que o firmware sozinho não faz (um node só
-conecta a um servidor MQTT, e o LongFast público de cada um é o mesmo canal,
-diferindo só pelo root do tópico).
+Republishes a Meshtastic channel between **two MQTT servers**, letting a single
+device participate in the **public LongFast of each server** and **choose per
+message** which one to send to — something the firmware alone can't do (a node
+connects to only one MQTT server, and the public LongFast of each is the same
+channel, differing only by the topic root).
 
-## Como funciona
+## How it works
 
-O device usa um **2º canal com nome local diferente** (ex.: `LongFastCO`) mas com
-a **mesma PSK pública** do LongFast (`AQ==`). O firmware cifra o payload com a
-chave certa; a única diferença para o LongFast público é o **byte de hash do
-canal** (muda porque o nome muda).
+The device uses a **second channel with a different local name** (e.g.
+`LongFastCO`) but the **same public LongFast PSK** (`AQ==`). The firmware
+encrypts the payload with the correct key; the only difference from the public
+LongFast is the **channel-hash byte** (it changes because the name changes).
 
-Este serviço então, **sem recriptografar nada**:
+This service then, **without re-encrypting anything**:
 
-- **saída:** lê `LOCAL_ROOT/2/e/LongFastCO/#` no broker local, reescreve
-  `packet.channel` → hash do LongFast (8) e `channel_id` → `LongFast`, e publica
-  em `REMOTE_ROOT/2/e/LongFast/#` no servidor remoto (público).
-- **entrada:** o inverso, para o device receber o tráfego do público remoto no
-  canal local `LongFastCO`.
+- **outbound:** reads `LOCAL_ROOT/2/e/LongFastCO/#` on the local broker, rewrites
+  `packet.channel` to the LongFast hash (8) and `channel_id` to `LongFast`, and
+  publishes to `REMOTE_ROOT/2/e/LongFast/#` on the remote (public) server.
+- **inbound:** the reverse, so the device receives the remote public traffic on
+  its local `LongFastCO` channel.
 
-Loop é evitado por dedup de `packet.id`.
+Loops are prevented by deduplicating on `packet.id`.
 
 ```
-app (você escolhe)         servidor (o que chega)
-canal "LongFast"   ───────► meshbrasil : LongFast  (nativo do firmware)
-canal "LongFastCO" ──swap─► US/CO      : LongFast  (este republicador)
+app (you choose)            server (what arrives)
+channel "LongFast"   ──────► meshbrasil : LongFast  (native firmware MQTT)
+channel "LongFastCO" ──swap─► US/CO      : LongFast  (this republisher)
 ```
 
-## Por que não um bridge MQTT comum (mosquitto)
+## Why not a plain MQTT bridge (mosquitto)
 
-Mosquitto só renomeia tópico — **não recalcula o hash do canal** que vai dentro
-do pacote, então o nó público do outro servidor rejeitaria a mensagem. Este
-serviço fala protobuf Meshtastic e corrige o hash.
+Mosquitto only renames the topic — it **does not recompute the channel hash**
+carried inside the packet, so the public node on the other server would reject
+the message. This service speaks the Meshtastic protobuf and fixes the hash.
 
-## Configuração (variáveis de ambiente)
+## Configuration (environment variables)
 
-| Var | Default | Descrição |
+| Var | Default | Description |
 |---|---|---|
-| `LOCAL_MQTT_HOST` | `127.0.0.1` | broker local (mosquitto) |
+| `LOCAL_MQTT_HOST` | `127.0.0.1` | local broker (mosquitto) |
 | `LOCAL_MQTT_PORT` | `1883` | |
-| `LOCAL_MQTT_USER` / `LOCAL_MQTT_PASS` | — | credenciais do broker local |
-| `LOCAL_ROOT` | `meshdev` | root do tópico local |
-| `LOCAL_CHANNEL` | `LongFastCO` | nome do canal LOCAL (apelido) |
-| `REMOTE_MQTT_HOST` | `mqtt.meshtastic.org` | servidor público remoto |
+| `LOCAL_MQTT_USER` / `LOCAL_MQTT_PASS` | — | local broker credentials |
+| `LOCAL_ROOT` | `meshdev` | local topic root |
+| `LOCAL_CHANNEL` | `LongFastCO` | LOCAL channel name (the alias) |
+| `REMOTE_MQTT_HOST` | `mqtt.meshtastic.org` | remote public server |
 | `REMOTE_MQTT_PORT` | `1883` | |
-| `REMOTE_MQTT_USER` / `REMOTE_MQTT_PASS` | `meshdev` / `large4cats` | credenciais públicas |
-| `REMOTE_ROOT` | `msh/US/CO` | root do tópico remoto |
-| `REMOTE_CHANNEL` | `LongFast` | canal público remoto |
-| `LOG_LEVEL` | `INFO` | `DEBUG` para ver cada republicação |
+| `REMOTE_MQTT_USER` / `REMOTE_MQTT_PASS` | `meshdev` / `large4cats` | public credentials |
+| `REMOTE_ROOT` | `msh/US/CO` | remote topic root |
+| `REMOTE_CHANNEL` | `LongFast` | remote public channel |
+| `LOG_LEVEL` | `INFO` | `DEBUG` to log every republish |
 
-O canal `LongFastCO` no device **deve usar a PSK `AQ==`** (a mesma do LongFast),
-senão o payload não decripta no público remoto.
+The `LongFastCO` channel on the device **must use the `AQ==` PSK** (the same as
+LongFast), otherwise the payload won't decrypt on the remote public server.
 
-## Rodar
+## Run
 
 ```bash
 docker build -t bridge-mqtt-multi-longfast .
 docker run -d --name bridge-mqtt \
-  -e LOCAL_MQTT_HOST=<IP-DO-SEU-BROKER> \
-  -e LOCAL_MQTT_USER=<user> -e LOCAL_MQTT_PASS=<senha> \
+  -e LOCAL_MQTT_HOST=<YOUR-BROKER-IP> \
+  -e LOCAL_MQTT_USER=<user> -e LOCAL_MQTT_PASS=<password> \
   -e REMOTE_ROOT=msh/US/CO \
   bridge-mqtt-multi-longfast
 ```
 
-## Aviso
+## Notice
 
-Publicar num servidor MQTT público (ex.: `mqtt.meshtastic.org`) deve respeitar as
-regras de uso do servidor. Este serviço foi feito para republicar **o tráfego dos
-seus próprios nós**, não para relay de redes inteiras.
+Publishing to a public MQTT server (e.g. `mqtt.meshtastic.org`) must respect that
+server's usage policy. This service is meant to republish **your own nodes'
+traffic**, not to relay entire networks.
