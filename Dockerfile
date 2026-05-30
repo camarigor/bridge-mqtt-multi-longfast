@@ -6,6 +6,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY republisher.py .
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 # HTTP status page
 EXPOSE 8080
@@ -13,4 +15,5 @@ EXPOSE 8080
 # non-root
 USER 1000:1000
 
-ENTRYPOINT ["python", "-u", "republisher.py"]
+# entrypoint optionally sources ${BRIDGE_ENV_FILE:-/data/bridge.env} then runs the app
+ENTRYPOINT ["/app/entrypoint.sh"]
