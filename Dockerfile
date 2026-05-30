@@ -7,6 +7,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY republisher.py .
 
+# HTTP status page
+EXPOSE 8080
+
 # non-root
 USER 1000:1000
 

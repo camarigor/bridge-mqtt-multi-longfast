@@ -49,7 +49,12 @@ the message. This service speaks the Meshtastic protobuf and fixes the hash.
 | `REMOTE_MQTT_USER` / `REMOTE_MQTT_PASS` | `meshdev` / `large4cats` | public credentials |
 | `REMOTE_ROOT` | `msh/US/CO` | remote topic root |
 | `REMOTE_CHANNEL` | `LongFast` | remote public channel |
+| `STATUS_PORT` | `8080` | HTTP status page port |
 | `LOG_LEVEL` | `INFO` | `DEBUG` to log every republish |
+
+A minimal status page is served on `STATUS_PORT` (`/` for HTML, `/status.json`
+for JSON): broker connection state, relay counters, and config summary (no
+secrets).
 
 The `LongFastCO` channel on the device **must use the `AQ==` PSK** (the same as
 LongFast), otherwise the payload won't decrypt on the remote public server.
