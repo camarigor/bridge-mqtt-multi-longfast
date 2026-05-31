@@ -10,8 +10,16 @@ published to ONE local broker (mosquitto).
 
 This service is the single router: it connects to the local broker and to each
 remote public server, and for every configured bridge it relays a local channel
-to/from a remote channel, rewriting only the channel-hash byte + channel_id (no
-re-encryption — the PSK is the same AQ==). Loops are avoided by packet-id dedup.
+to/from a remote channel, rewriting the channel-hash byte + channel_id. The PSK
+is the same AQ==, so no re-encryption is needed.
+
+Some remotes' ecosystems publish PLAINTEXT (decoded) packets rather than
+encrypted ones — e.g. a regional mqtt.meshtastic.org root where gateways uplink
+already-decoded packets. For those, set BRIDGE{N}_REMOTE_DECODED=true: the app
+decrypts outbound packets to plaintext before publishing (so the remote's tools
+read them), and relays the remote's decoded packets inbound (the local device
+accepts both encrypted and plaintext downlink). Loops are avoided by packet-id
+dedup.
 
 Architecture:  device -> mosquitto (local) <-> this app -> {meshbrasil, US/CO, ...}
 
@@ -24,6 +32,7 @@ import sys
 import time
 import json
 import uuid
+import struct
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,9 +40,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import paho.mqtt.client as mqtt
 
 try:
-    from meshtastic.protobuf import mqtt_pb2
+    from meshtastic.protobuf import mqtt_pb2, mesh_pb2
 except ImportError:  # pragma: no cover
-    from meshtastic import mqtt_pb2  # type: ignore
+    from meshtastic import mqtt_pb2, mesh_pb2  # type: ignore
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 
 def env(key, default=None, required=False):
@@ -42,6 +53,9 @@ def env(key, default=None, required=False):
         logging.error("Missing required environment variable: %s", key)
         sys.exit(1)
     return v
+
+def env_bool(key, default=False):
+    return str(os.environ.get(key, str(default))).strip().lower() in ("1", "true", "yes", "on")
 
 # Shared local broker
 LOCAL_HOST = env("LOCAL_MQTT_HOST", "127.0.0.1")
@@ -76,6 +90,32 @@ def channel_hash(name: str) -> int:
         h ^= b
     return h & 0xFF
 
+
+def decrypt_to_data(pkt):
+    """Decrypt an AQ==-channel-encrypted MeshPacket into a plaintext Data.
+
+    Meshtastic uses AES-CTR with a 16-byte nonce = packet_id (u64 LE) +
+    from (u32 LE) + 4 zero bytes, and the expanded default key for PSK AQ==.
+    Returns the Data, or None if it doesn't decode (foreign key / PKI packet).
+    """
+    try:
+        frm = getattr(pkt, "from")
+        # The CTR nonce is the Meshtastic protocol-defined value (packet_id + from
+        # node), NOT a random IV. It MUST be deterministic so any receiver holding
+        # the channel PSK derives the identical nonce to decrypt. Using os.urandom
+        # here would break interoperability — hence the scanner hit is a false
+        # positive on this protocol-mandated construction.
+        nonce = struct.pack("<Q", pkt.id) + struct.pack("<I", frm) + b"\x00\x00\x00\x00"  # nosemgrep
+        dec = Cipher(algorithms.AES(DEFAULT_KEY), modes.CTR(nonce)).decryptor()  # nosemgrep
+        raw = dec.update(pkt.encrypted) + dec.finalize()
+        d = mesh_pb2.Data()
+        d.ParseFromString(raw)
+        if d.portnum == 0:  # PORTNUM_UNKNOWN -> garbage (wrong key / PKI packet)
+            return None
+        return d
+    except Exception:
+        return None
+
 # ---------------------------------------------------------------------------
 # Bridge definitions (one local channel <-> one remote channel/server each)
 # ---------------------------------------------------------------------------
@@ -95,6 +135,7 @@ def load_bridges():
             "remote_pass": env(p + "REMOTE_PASS", ""),
             "remote_root": env(p + "REMOTE_ROOT", "msh"),
             "remote_channel": rc, "remote_hash": channel_hash(rc),
+            "remote_decoded": env_bool(p + "REMOTE_DECODED", False),
             "connected": False, "out": 0, "in": 0, "client": None,
         })
         i += 1
@@ -110,6 +151,7 @@ def load_bridges():
             "remote_pass": env("REMOTE_MQTT_PASS", ""),
             "remote_root": env("REMOTE_ROOT", "msh/US/CO"),
             "remote_channel": rc, "remote_hash": channel_hash(rc),
+            "remote_decoded": env_bool("REMOTE_DECODED", False),
             "connected": False, "out": 0, "in": 0, "client": None,
         })
     return bridges
@@ -143,17 +185,30 @@ def topic_channel(topic: str) -> str:
 def topic_gateway(topic: str) -> str:
     return topic.rsplit("/", 1)[-1]
 
-def repackage(payload: bytes, new_hash: int, new_channel_id: str):
-    """Rewrite packet.channel + channel_id of a ServiceEnvelope. Returns
-    (reserialized_bytes, packet_id) or (None, None) if not applicable."""
+def repackage(payload: bytes, new_hash: int, new_channel_id: str, make_decoded: bool = False):
+    """Move a ServiceEnvelope onto a different channel by rewriting packet.channel
+    + channel_id. Handles both encrypted and already-plaintext (decoded) packets.
+
+    When make_decoded is set and the packet is encrypted, it is decrypted to
+    plaintext (for remotes whose ecosystem publishes decoded packets). Returns
+    (reserialized_bytes, packet_id) or (None, None) if not applicable /
+    undecryptable."""
     se = mqtt_pb2.ServiceEnvelope()
     se.ParseFromString(payload)
     if not se.HasField("packet"):
         return None, None
     pkt = se.packet
-    if not pkt.HasField("encrypted") or len(pkt.encrypted) == 0:
-        return None, None
     pid = pkt.id
+    if pkt.HasField("encrypted") and len(pkt.encrypted) > 0:
+        if make_decoded:
+            data = decrypt_to_data(pkt)
+            if data is None:
+                return None, None  # foreign key / PKI -> can't convert, skip
+            pkt.decoded.CopyFrom(data)  # oneof: setting `decoded` clears `encrypted`
+    elif pkt.HasField("decoded"):
+        pass  # already plaintext -> relay as-is
+    else:
+        return None, None
     pkt.channel = new_hash
     se.channel_id = new_channel_id
     return se.SerializeToString(), pid
@@ -167,7 +222,9 @@ def on_local_message(local_client):
             b = CH2BRIDGE.get(topic_channel(msg.topic))
             if b is None:
                 return
-            payload, pid = repackage(msg.payload, b["remote_hash"], b["remote_channel"])
+            # outbound: convert to plaintext if the remote speaks decoded
+            payload, pid = repackage(msg.payload, b["remote_hash"], b["remote_channel"],
+                                     make_decoded=b["remote_decoded"])
             if payload is None:
                 return
             if pid and already_seen(pid):
@@ -176,8 +233,9 @@ def on_local_message(local_client):
             dst = f"{b['remote_root']}/2/e/{b['remote_channel']}/{gw}"
             b["client"].publish(dst, payload, qos=0)
             b["out"] += 1
-            log.info("[%s out] id=0x%x %s -> %s (hash->%d)",
-                     b["name"], pid or 0, msg.topic, dst, b["remote_hash"])
+            log.info("[%s out] id=0x%x %s -> %s (hash->%d%s)",
+                     b["name"], pid or 0, msg.topic, dst, b["remote_hash"],
+                     " plain" if b["remote_decoded"] else "")
         except Exception as e:
             ERRORS["v"] += 1
             log.warning("[local] error on %s: %s", msg.topic, e)
@@ -186,7 +244,10 @@ def on_local_message(local_client):
 def on_remote_message(b, local_client):
     def handler(client, userdata, msg):
         try:
-            payload, pid = repackage(msg.payload, b["local_hash"], b["local_channel"])
+            # inbound: relay as-is (the local device accepts both encrypted and
+            # plaintext downlink); just move it onto the local channel hash.
+            payload, pid = repackage(msg.payload, b["local_hash"], b["local_channel"],
+                                     make_decoded=False)
             if payload is None:
                 return
             if pid and already_seen(pid):
@@ -222,6 +283,7 @@ def status_payload():
             "local_channel": b["local_channel"], "local_hash": b["local_hash"],
             "remote": f"{b['remote_host']} {b['remote_root']}/{b['remote_channel']}",
             "remote_hash": b["remote_hash"], "out": b["out"], "in": b["in"],
+            "remote_fmt": "plain" if b["remote_decoded"] else "encrypted",
         } for b in BRIDGES],
         "errors": ERRORS["v"],
         "uptime_seconds": int(time.time() - STARTED),
@@ -242,7 +304,7 @@ class StatusHandler(BaseHTTPRequestHandler):
             rows = "".join(
                 f"<tr><td>{b['name']}</td><td>{dot(b['connected'])}</td>"
                 f"<td>{b['local_channel']} ({b['local_hash']})</td>"
-                f"<td>{b['remote']} ({b['remote_hash']})</td>"
+                f"<td>{b['remote']} ({b['remote_hash']}, {b['remote_fmt']})</td>"
                 f"<td>{b['out']}</td><td>{b['in']}</td></tr>"
                 for b in s["bridges"])
             body = f"""<!doctype html><html><head><meta charset=utf-8>
@@ -277,9 +339,10 @@ def main():
         sys.exit(1)
     log.info("LOCAL %s:%d root=%s", LOCAL_HOST, LOCAL_PORT, LOCAL_ROOT)
     for b in BRIDGES:
-        log.info("BRIDGE %s: local %s(h%d) <-> %s %s/%s(h%d)", b["name"],
+        log.info("BRIDGE %s: local %s(h%d) <-> %s %s/%s(h%d) [%s]", b["name"],
                  b["local_channel"], b["local_hash"], b["remote_host"],
-                 b["remote_root"], b["remote_channel"], b["remote_hash"])
+                 b["remote_root"], b["remote_channel"], b["remote_hash"],
+                 "plaintext" if b["remote_decoded"] else "encrypted")
 
     start_status_server()
 
